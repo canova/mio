@@ -20,6 +20,24 @@ pub struct Selector {
     has_waker: AtomicBool,
 }
 
+#[cfg_attr(feature = "unstable", cfg(sanitize = "thread"))]
+// #[cfg_attr(not(feature = "unstable"), cfg(FALSE))]
+extern "C" {
+    fn __sanitizer_syscall_pre_impl_epoll_wait(
+        epfd: libc::c_long,
+        events: libc::c_long,
+        maxevents: libc::c_long,
+        timeout: libc::c_long,
+    ) -> libc::c_long;
+    fn __sanitizer_syscall_post_impl_epoll_wait(
+        res: libc::c_long,
+        epfd: libc::c_long,
+        events: libc::c_long,
+        maxevents: libc::c_long,
+        timeout: libc::c_long,
+    ) -> libc::c_long;
+}
+
 impl Selector {
     pub fn new() -> io::Result<Selector> {
         #[cfg(not(target_os = "android"))]
@@ -100,17 +118,8 @@ impl Selector {
             .unwrap_or(-1);
 
         events.clear();
-        syscall!(epoll_wait(
-            self.ep,
-            events.as_mut_ptr(),
-            events.capacity() as i32,
-            timeout,
-        ))
-        .map(|n_events| {
-            // This is safe because `epoll_wait` ensures that `n_events` are
-            // assigned.
-            unsafe { events.set_len(n_events as usize) };
-        })
+
+        epoll_wait(self.ep, events, timeout)
     }
 
     pub fn register(&self, fd: RawFd, token: Token, interests: Interest) -> io::Result<()> {
@@ -143,6 +152,54 @@ impl Selector {
     pub fn register_waker(&self) -> bool {
         self.has_waker.swap(true, Ordering::AcqRel)
     }
+}
+
+#[cfg_attr(feature = "unstable", cfg(not(sanitize = "thread")))]
+fn epoll_wait(ep: RawFd, events: &mut Events, timeout: i32) -> io::Result<()> {
+    syscall!(epoll_wait(
+        ep,
+        events.as_mut_ptr(),
+        events.capacity() as i32,
+        timeout,
+    ))
+    .map(|n_events| {
+        // This is safe because `epoll_wait` ensures that `n_events` are
+        // assigned.
+        unsafe { events.set_len(n_events as usize) };
+    })
+}
+
+#[cfg(feature = "unstable")]
+#[cfg_attr(feature = "unstable", cfg(sanitize = "thread"))]
+fn epoll_wait(ep: RawFd, events: &mut Events, timeout: i32) -> io::Result<()> {
+    unsafe {
+        __sanitizer_syscall_pre_impl_epoll_wait(
+            ep as libc::c_long,
+            events.as_mut_ptr() as libc::c_long,
+            events.capacity() as i32 as libc::c_long,
+            timeout as libc::c_long,
+        );
+    }
+    syscall!(epoll_wait(
+        ep,
+        events.as_mut_ptr(),
+        events.capacity() as i32,
+        timeout,
+    ))
+    .map(|n_events| {
+        unsafe {
+            __sanitizer_syscall_post_impl_epoll_wait(
+                n_events as libc::c_long,
+                ep as libc::c_long,
+                events.as_mut_ptr() as libc::c_long,
+                events.capacity() as i32 as libc::c_long,
+                timeout as libc::c_long,
+            );
+        }
+        // This is safe because `epoll_wait` ensures that `n_events` are
+        // assigned.
+        unsafe { events.set_len(n_events as usize) };
+    })
 }
 
 cfg_io_source! {
